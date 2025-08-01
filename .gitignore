@@ -1,0 +1,100 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pyc
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ML Models (keep only versioned models)
+models/*.pkl
+models/*.joblib
+models/*.h5
+models/*.pt
+models/*.pth
+!models/fraud_model_v1.pkl
+!models/.gitkeep
+
+# Data files
+data/
+*.csv
+*.parquet
+*.feather
+!data/.gitkeep
+
+# Logs
+logs/
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+
+# Docker volumes
+docker/monitoring/prometheus_data/
+docker/monitoring/grafana_data/
+
+# Kafka/Redis
+kafka-logs/
+zookeeper/
+dump.rdb
+appendonly.aof
+
+# Secrets
+.env
+.env.*
+secrets/
+credentials.json
+*.key
+*.pem
+config/*.secret.yaml
+
+# OS files
+Thumbs.db
+.DS_Store
+.Spotlight-V100
+.Trashes

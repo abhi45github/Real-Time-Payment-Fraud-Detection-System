@@ -1,0 +1,160 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-cluster
+  namespace: fraud-detection
+spec:
+  serviceName: redis-headless
+  replicas: 6
+  selector:
+    matchLabels:
+      app: redis
+      component: cluster
+  template:
+    metadata:
+      labels:
+        app: redis
+        component: cluster
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+          name: client
+        - containerPort: 16379
+          name: gossip
+        command:
+        - redis-server
+        args:
+        - /conf/redis.conf
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        volumeMounts:
+        - name: conf
+          mountPath: /conf
+        - name: data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+        livenessProbe:
+          tcpSocket:
+            port: 6379
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: conf
+        configMap:
+          name: redis-config
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: fraud-detection
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+  - port: 6379
+    targetPort: 6379
+    name: client
+  - port: 16379
+    targetPort: 16379
+    name: gossip
+  selector:
+    app: redis
+    component: cluster
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster
+  namespace: fraud-detection
+spec:
+  type: ClusterIP
+  ports:
+  - port: 6379
+    targetPort: 6379
+    name: client
+  selector:
+    app: redis
+    component: cluster
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: fraud-detection
+data:
+  redis.conf: |
+    # Redis configuration for high-performance fraud detection
+    port 6379
+    cluster-enabled yes
+    cluster-config-file /data/nodes.conf
+    cluster-node-timeout 5000
+    cluster-announce-ip $(POD_IP)
+    cluster-announce-port 6379
+    cluster-announce-bus-port 16379
+    appendonly yes
+    appendfsync everysec
+    maxmemory 1gb
+    maxmemory-policy allkeys-lru
+    
+    # Performance optimizations
+    tcp-backlog 511
+    tcp-keepalive 60
+    timeout 0
+    
+    # Persistence
+    save 900 1
+    save 300 10
+    save 60 10000
+    
+    # Logging
+    loglevel notice
+    logfile ""
+    
+    # Clients
+    maxclients 10000
+    
+    # Memory optimization
+    lazyfree-lazy-eviction yes
+    lazyfree-lazy-expire yes
+    lazyfree-lazy-server-del yes
+    replica-lazy-flush yes
+    
+    # Performance tuning
+    hz 50
+    dynamic-hz yes
+    
+    # Security
+    protected-mode no
+    requirepass fraud_redis_password
+    masterauth fraud_redis_password

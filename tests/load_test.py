@@ -1,0 +1,286 @@
+"""
+Load Testing for Fraud Detection System
+Verifies 5000 TPS with <100ms latency requirement
+Uses Locust for distributed load testing
+"""
+
+import random
+import time
+import json
+import uuid
+from locust import HttpUser, task, between, events
+from locust.contrib.fasthttp import FastHttpUser
+import numpy as np
+
+# Performance tracking
+response_times = []
+successful_requests = 0
+failed_requests = 0
+
+class FraudDetectionUser(FastHttpUser):
+    """
+    Simulates users sending fraud detection requests
+    Optimized for high-throughput testing
+    """
+    
+    # Wait time between requests (for achieving 5000 TPS)
+    wait_time = between(0.0001, 0.002)
+    
+    def on_start(self):
+        """Initialize user session"""
+        self.user_id_pool = [f"user_{i}" for i in range(1, 100001)]
+        self.merchant_id_pool = [f"merchant_{i}" for i in range(1, 10001)]
+        self.device_id_pool = [f"device_{i}" for i in range(1, 50001)]
+        self.countries = ['US', 'GB', 'CA', 'AU', 'FR', 'DE', 'JP', 'CN', 'IN', 'BR']
+        self.merchant_categories = ['retail', 'food', 'travel', 'entertainment', 
+                                   'health', 'education', 'gambling', 'crypto']
+        self.entry_modes = ['chip', 'swipe', 'online', 'contactless', 'manual']
+        
+    @task(weight=95)
+    def detect_fraud_normal(self):
+        """Normal transaction - 95% of traffic"""
+        
+        transaction = self._generate_normal_transaction()
+        
+        with self.client.post(
+            "/api/v1/detect",
+            json=transaction,
+            catch_response=True
+        ) as response:
+            
+            if response.status_code == 200:
+                response_time = response.elapsed.total_seconds() * 1000
+                
+                # Check SLA compliance
+                if response_time > 100:
+                    response.failure(f"SLA violation: {response_time:.2f}ms > 100ms")
+                else:
+                    response.success()
+                    
+                # Validate response structure
+                try:
+                    data = response.json()
+                    assert 'decision' in data
+                    assert 'risk_score' in data
+                    assert 0 <= data['risk_score'] <= 1
+                except (json.JSONDecodeError, AssertionError, KeyError) as e:
+                    response.failure(f"Invalid response format: {e}")
+            else:
+                response.failure(f"HTTP {response.status_code}")
+    
+    @task(weight=5)
+    def detect_fraud_suspicious(self):
+        """Suspicious transaction - 5% of traffic"""
+        
+        transaction = self._generate_suspicious_transaction()
+        
+        with self.client.post(
+            "/api/v1/detect",
+            json=transaction,
+            catch_response=True
+        ) as response:
+            
+            if response.status_code == 200:
+                response_time = response.elapsed.total_seconds() * 1000
+                
+                if response_time > 100:
+                    response.failure(f"SLA violation: {response_time:.2f}ms")
+                else:
+                    response.success()
+            else:
+                response.failure(f"HTTP {response.status_code}")
+    
+    @task(weight=1)
+    def batch_detection(self):
+        """Batch transaction detection"""
+        
+        batch_size = random.randint(5, 20)
+        transactions = [
+            self._generate_normal_transaction() 
+            for _ in range(batch_size)
+        ]
+        
+        with self.client.post(
+            "/api/v1/detect/batch",
+            json={"transactions": transactions},
+            catch_response=True
+        ) as response:
+            
+            if response.status_code == 200:
+                response.success()
+            else:
+                response.failure(f"Batch failed: HTTP {response.status_code}")
+    
+    @task(weight=1)
+    def health_check(self):
+        """Health check endpoint"""
+        
+        with self.client.get(
+            "/api/v1/health",
+            catch_response=True
+        ) as response:
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') in ['healthy', 'degraded']:
+                    response.success()
+                else:
+                    response.failure("Unhealthy status")
+            else:
+                response.failure(f"Health check failed: HTTP {response.status_code}")
+    
+    def _generate_normal_transaction(self):
+        """Generate a normal transaction"""
+        
+        return {
+            "transaction_id": f"txn_{uuid.uuid4().hex[:12]}",
+            "user_id": random.choice(self.user_id_pool),
+            "merchant_id": random.choice(self.merchant_id_pool),
+            "amount": round(np.random.lognormal(3.5, 1.5), 2),  # Log-normal distribution
+            "currency": "USD",
+            "merchant_category": random.choice(self.merchant_categories[:6]),  # Exclude high-risk
+            "entry_mode": random.choice(self.entry_modes),
+            "country": random.choice(self.countries[:5]),  # Normal countries
+            "ip_address": f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}",
+            "device_id": random.choice(self.device_id_pool),
+            "timestamp": time.time()
+        }
+    
+    def _generate_suspicious_transaction(self):
+        """Generate a suspicious transaction with fraud indicators"""
+        
+        transaction = self._generate_normal_transaction()
+        
+        # Add suspicious characteristics
+        suspicious_features = random.choice([
+            {"amount": round(random.uniform(5000, 20000), 2)},  # High amount
+            {"merchant_category": random.choice(['gambling', 'crypto'])},  # Risky category
+            {"country": random.choice(['NG', 'PK', 'RO'])},  # High-risk country
+            {"amount": round(random.uniform(3000, 8000), 2), 
+             "merchant_category": "crypto"},  # Combination
+        ])
+        
+        transaction.update(suspicious_features)
+        return transaction
+
+
+class StressTestUser(FastHttpUser):
+    """
+    Stress testing user for pushing system limits
+    Used to find breaking point beyond 5000 TPS
+    """
+    
+    wait_time = between(0.0001, 0.0005)  # Minimal wait for maximum load
+    
+    @task
+    def rapid_fire(self):
+        """Send rapid-fire requests"""
+        
+        # Pre-generate transaction for speed
+        transaction = {
+            "transaction_id": f"stress_{uuid.uuid4().hex[:8]}",
+            "user_id": f"user_{random.randint(1, 1000)}",
+            "merchant_id": f"merchant_{random.randint(1, 100)}",
+            "amount": round(random.uniform(10, 1000), 2),
+            "currency": "USD",
+            "merchant_category": "retail",
+            "entry_mode": "online",
+            "country": "US",
+            "ip_address": "192.168.1.1",
+            "device_id": "device_1"
+        }
+        
+        self.client.post(
+            "/api/v1/detect",
+            json=transaction,
+            catch_response=False  # Don't wait for response validation
+        )
+
+
+# Custom event hooks for detailed metrics
+
+@events.request.add_listener
+def on_request(request_type, name, response_time, response_length, response, **kwargs):
+    """Track detailed metrics for each request"""
+    
+    global response_times, successful_requests, failed_requests
+    
+    if response_time:
+        response_times.append(response_time)
+    
+    if response and response.status_code < 400:
+        successful_requests += 1
+    else:
+        failed_requests += 1
+
+
+@events.test_stop.add_listener
+def on_test_stop(**kwargs):
+    """Calculate and report final metrics"""
+    
+    global response_times, successful_requests, failed_requests
+    
+    if response_times:
+        print("\n" + "="*60)
+        print("LOAD TEST RESULTS")
+        print("="*60)
+        
+        # Calculate percentiles
+        p50 = np.percentile(response_times, 50)
+        p95 = np.percentile(response_times, 95)
+        p99 = np.percentile(response_times, 99)
+        
+        print(f"Total Requests: {successful_requests + failed_requests}")
+        print(f"Successful: {successful_requests}")
+        print(f"Failed: {failed_requests}")
+        print(f"Success Rate: {successful_requests/(successful_requests + failed_requests)*100:.2f}%")
+        print(f"\nResponse Times (ms):")
+        print(f"  P50: {p50:.2f}")
+        print(f"  P95: {p95:.2f}")
+        print(f"  P99: {p99:.2f}")
+        print(f"  Min: {min(response_times):.2f}")
+        print(f"  Max: {max(response_times):.2f}")
+        print(f"  Mean: {np.mean(response_times):.2f}")
+        
+        # SLA compliance
+        under_100ms = sum(1 for rt in response_times if rt < 100)
+        sla_compliance = under_100ms / len(response_times) * 100
+        print(f"\nSLA Compliance (<100ms): {sla_compliance:.2f}%")
+        
+        # Performance rating
+        if sla_compliance >= 99 and p95 < 100:
+            print("\n✅ EXCELLENT: System meets all SLA requirements")
+        elif sla_compliance >= 95 and p95 < 150:
+            print("\n✓ GOOD: System performs well with minor SLA violations")
+        elif sla_compliance >= 90:
+            print("\n⚠ WARNING: System shows performance degradation")
+        else:
+            print("\n❌ CRITICAL: System fails to meet SLA requirements")
+        
+        print("="*60)
+
+
+if __name__ == "__main__":
+    import os
+    
+    # Example: Run load test from command line
+    # locust -f load_test.py --host=http://localhost:8000 --users=1000 --spawn-rate=100
+    
+    print("""
+    ╔══════════════════════════════════════════════════════════╗
+    ║     FRAUD DETECTION SYSTEM - LOAD TEST SUITE            ║
+    ╠══════════════════════════════════════════════════════════╣
+    ║                                                          ║
+    ║  Target: 5000 TPS with <100ms latency                   ║
+    ║  Test Types:                                            ║
+    ║    1. Normal Load (FraudDetectionUser)                  ║
+    ║    2. Stress Test (StressTestUser)                      ║
+    ║                                                          ║
+    ║  Usage:                                                  ║
+    ║    locust -f load_test.py --host=http://localhost:8000  ║
+    ║    --users=1000 --spawn-rate=100                        ║
+    ║                                                          ║
+    ║  Web UI: http://localhost:8089                          ║
+    ║                                                          ║
+    ╚══════════════════════════════════════════════════════════╝
+    """)
