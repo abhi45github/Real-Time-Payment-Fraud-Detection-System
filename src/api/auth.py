@@ -1,0 +1,435 @@
+"""
+Authentication and Security for Fraud Detection API
+Implements JWT-based auth, API key validation, and rate limiting
+"""
+
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List
+import jwt
+import hashlib
+import secrets
+from fastapi import HTTPException, Security, Depends, status, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, APIKeyHeader
+from pydantic import BaseModel
+import redis
+import time
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration
+JWT_SECRET_KEY = "your-secret-key-change-in-production"  # Should be in env vars
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24
+API_KEY_LENGTH = 32
+
+
+class TokenData(BaseModel):
+    """JWT Token payload"""
+    client_id: str
+    scope: List[str]
+    exp: datetime
+    iat: datetime
+    jti: str  # JWT ID for tracking
+
+
+class APIKey(BaseModel):
+    """API Key model"""
+    key: str
+    client_id: str
+    client_name: str
+    scope: List[str]
+    rate_limit: int  # Requests per minute
+    created_at: datetime
+    expires_at: Optional[datetime]
+    is_active: bool
+
+
+class AuthManager:
+    """Manages authentication and authorization"""
+
+    def __init__(self, redis_client: redis.Redis):
+        """Initialize auth manager with Redis for token/key storage"""
+        self.redis = redis_client
+        self.security = HTTPBearer()
+        self.api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+    def generate_api_key(self, client_id: str, client_name: str,
+                        scope: List[str] = None,
+                        rate_limit: int = 1000,
+                        expires_in_days: int = 365) -> APIKey:
+        """Generate new API key for client"""
+
+        key = secrets.token_urlsafe(API_KEY_LENGTH)
+        hashed_key = self._hash_key(key)
+
+        api_key = APIKey(
+            key=key,
+            client_id=client_id,
+            client_name=client_name,
+            scope=scope or ["fraud:detect"],
+            rate_limit=rate_limit,
+            created_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(days=expires_in_days),
+            is_active=True
+        )
+
+        # Store in Redis with expiration
+        self.redis.setex(
+            f"api_key:{hashed_key}",
+            expires_in_days * 86400,
+            api_key.json()
+        )
+
+        logger.info(f"Generated API key for client {client_id}")
+        return api_key
+
+    def _hash_key(self, key: str) -> str:
+        """Hash API key for secure storage"""
+        return hashlib.sha256(key.encode()).hexdigest()
+
+    async def validate_api_key(self, api_key: str) -> APIKey:
+        """Validate API key and return key data"""
+
+        if not api_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="API key required"
+            )
+
+        hashed_key = self._hash_key(api_key)
+        key_data = self.redis.get(f"api_key:{hashed_key}")
+
+        if not key_data:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid API key"
+            )
+
+        api_key_obj = APIKey.parse_raw(key_data)
+
+        # Check if key is active
+        if not api_key_obj.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="API key is disabled"
+            )
+
+        # Check expiration
+        if api_key_obj.expires_at and api_key_obj.expires_at < datetime.utcnow():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="API key expired"
+            )
+
+        return api_key_obj
+
+    def generate_jwt_token(self, client_id: str, scope: List[str] = None) -> str:
+        """Generate JWT token for authenticated client"""
+
+        now = datetime.utcnow()
+        expires = now + timedelta(hours=JWT_EXPIRATION_HOURS)
+
+        payload = {
+            "client_id": client_id,
+            "scope": scope or ["fraud:detect"],
+            "exp": expires,
+            "iat": now,
+            "jti": secrets.token_urlsafe(16)  # Unique token ID
+        }
+
+        token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+        # Store token ID in Redis for revocation checking
+        self.redis.setex(
+            f"jwt:{payload['jti']}",
+            JWT_EXPIRATION_HOURS * 3600,
+            client_id
+        )
+
+        return token
+
+    async def validate_jwt_token(self, credentials: HTTPAuthorizationCredentials) -> TokenData:
+        """Validate JWT token"""
+
+        if not credentials:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Bearer token required"
+            )
+
+        try:
+            payload = jwt.decode(
+                credentials.credentials,
+                JWT_SECRET_KEY,
+                algorithms=[JWT_ALGORITHM]
+            )
+
+            # Check if token is revoked
+            jti = payload.get("jti")
+            if jti and not self.redis.exists(f"jwt:{jti}"):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Token has been revoked"
+                )
+
+            return TokenData(**payload)
+
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has expired"
+            )
+        except jwt.InvalidTokenError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token"
+            )
+
+    def revoke_token(self, jti: str):
+        """Revoke a JWT token"""
+        self.redis.delete(f"jwt:{jti}")
+        logger.info(f"Revoked token {jti}")
+
+    def revoke_api_key(self, api_key: str):
+        """Revoke an API key"""
+        hashed_key = self._hash_key(api_key)
+        key_data = self.redis.get(f"api_key:{hashed_key}")
+
+        if key_data:
+            api_key_obj = APIKey.parse_raw(key_data)
+            api_key_obj.is_active = False
+            self.redis.set(f"api_key:{hashed_key}", api_key_obj.json())
+            logger.info(f"Revoked API key for client {api_key_obj.client_id}")
+
+
+class RateLimiter:
+    """Rate limiting implementation"""
+
+    def __init__(self, redis_client: redis.Redis):
+        """Initialize rate limiter with Redis backend"""
+        self.redis = redis_client
+
+    async def check_rate_limit(self, client_id: str, limit: int = 1000,
+                              window: int = 60) -> bool:
+        """
+        Check if client has exceeded rate limit
+
+        Args:
+            client_id: Client identifier
+            limit: Maximum requests per window
+            window: Time window in seconds
+
+        Returns:
+            True if within limit, False if exceeded
+        """
+
+        key = f"rate_limit:{client_id}"
+        current_time = time.time()
+        window_start = current_time - window
+
+        # Use Redis sorted set for sliding window
+        pipe = self.redis.pipeline()
+
+        # Remove old entries
+        pipe.zremrangebyscore(key, 0, window_start)
+
+        # Add current request
+        pipe.zadd(key, {str(current_time): current_time})
+
+        # Count requests in window
+        pipe.zcard(key)
+
+        # Set expiry
+        pipe.expire(key, window)
+
+        results = pipe.execute()
+        request_count = results[2]
+
+        if request_count > limit:
+            logger.warning(f"Rate limit exceeded for client {client_id}: {request_count}/{limit}")
+            return False
+
+        return True
+
+    def get_rate_limit_headers(self, client_id: str, limit: int = 1000,
+                              window: int = 60) -> Dict[str, str]:
+        """Get rate limit headers for response"""
+
+        key = f"rate_limit:{client_id}"
+        request_count = self.redis.zcard(key)
+        remaining = max(0, limit - request_count)
+        reset_time = int(time.time()) + window
+
+        return {
+            "X-RateLimit-Limit": str(limit),
+            "X-RateLimit-Remaining": str(remaining),
+            "X-RateLimit-Reset": str(reset_time)
+        }
+
+
+class SecurityMiddleware:
+    """Security middleware for request validation"""
+
+    def __init__(self, auth_manager: AuthManager, rate_limiter: RateLimiter):
+        """Initialize security middleware"""
+        self.auth_manager = auth_manager
+        self.rate_limiter = rate_limiter
+
+    async def validate_request(self, request: Request,
+                              api_key: Optional[str] = None,
+                              token: Optional[HTTPAuthorizationCredentials] = None):
+        """Validate incoming request"""
+
+        # Check for authentication
+        client_id = None
+        rate_limit = 1000
+
+        if api_key:
+            # Validate API key
+            api_key_obj = await self.auth_manager.validate_api_key(api_key)
+            client_id = api_key_obj.client_id
+            rate_limit = api_key_obj.rate_limit
+
+        elif token:
+            # Validate JWT token
+            token_data = await self.auth_manager.validate_jwt_token(token)
+            client_id = token_data.client_id
+
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required"
+            )
+
+        # Check rate limiting
+        if not await self.rate_limiter.check_rate_limit(client_id, rate_limit):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded",
+                headers=self.rate_limiter.get_rate_limit_headers(client_id, rate_limit)
+            )
+
+        # Validate IP whitelist (if configured)
+        client_ip = request.client.host
+        if not self._validate_ip_whitelist(client_id, client_ip):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"IP {client_ip} not whitelisted"
+            )
+
+        return client_id
+
+    def _validate_ip_whitelist(self, client_id: str, ip: str) -> bool:
+        """Check if IP is whitelisted for client"""
+
+        # Check Redis for IP whitelist
+        whitelist_key = f"ip_whitelist:{client_id}"
+        whitelist = self.auth_manager.redis.smembers(whitelist_key)
+
+        # If no whitelist configured, allow all
+        if not whitelist:
+            return True
+
+        # Check if IP is in whitelist
+        return ip.encode() in whitelist
+
+
+class PermissionChecker:
+    """Check permissions for specific operations"""
+
+    @staticmethod
+    def check_scope(required_scope: str, token_scope: List[str]) -> bool:
+        """Check if token has required scope"""
+
+        if "admin" in token_scope:
+            return True  # Admin has all permissions
+
+        return required_scope in token_scope
+
+    @staticmethod
+    def require_scope(scope: str):
+        """Decorator to require specific scope"""
+
+        def decorator(func):
+            async def wrapper(*args, **kwargs):
+                # Get token from request context
+                token_data = kwargs.get("token_data")
+
+                if not token_data:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Authentication required"
+                    )
+
+                if not PermissionChecker.check_scope(scope, token_data.scope):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"Insufficient permissions. Scope '{scope}' required"
+                    )
+
+                return await func(*args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+
+# Dependency injection functions for FastAPI
+
+async def get_current_client(
+    request: Request,
+    api_key: Optional[str] = Depends(APIKeyHeader(name="X-API-Key", auto_error=False)),
+    token: Optional[HTTPAuthorizationCredentials] = Security(HTTPBearer(auto_error=False))
+) -> str:
+    """Get current authenticated client"""
+
+    # Initialize managers (would typically be injected)
+    redis_client = redis.Redis(host='localhost', port=6379, db=0)
+    auth_manager = AuthManager(redis_client)
+    rate_limiter = RateLimiter(redis_client)
+    security = SecurityMiddleware(auth_manager, rate_limiter)
+
+    client_id = await security.validate_request(request, api_key, token)
+    return client_id
+
+
+async def require_admin(
+    client_id: str = Depends(get_current_client)
+) -> str:
+    """Require admin privileges"""
+
+    # Check if client has admin role
+    redis_client = redis.Redis(host='localhost', port=6379, db=0)
+    is_admin = redis_client.sismember("admin_clients", client_id)
+
+    if not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required"
+        )
+
+    return client_id
+
+
+if __name__ == "__main__":
+    # Example usage
+    redis_client = redis.Redis(host='localhost', port=6379, db=0)
+    auth_manager = AuthManager(redis_client)
+
+    # Generate API key
+    api_key = auth_manager.generate_api_key(
+        client_id="client_123",
+        client_name="Example Client",
+        scope=["fraud:detect", "fraud:review"],
+        rate_limit=5000
+    )
+    print(f"Generated API Key: {api_key.key}")
+
+    # Generate JWT token
+    token = auth_manager.generate_jwt_token(
+        client_id="client_123",
+        scope=["fraud:detect"]
+    )
+    print(f"Generated JWT Token: {token}")

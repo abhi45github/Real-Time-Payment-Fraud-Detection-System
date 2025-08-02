@@ -1,0 +1,192 @@
+# Alert Rules for Fraud Detection System
+groups:
+  - name: fraud_detection_alerts
+    interval: 30s
+    rules:
+      # SLA Violations
+      - alert: HighResponseTime
+        expr: histogram_quantile(0.99, rate(fraud_processing_time_seconds_bucket[5m])) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          component: api
+        annotations:
+          summary: "High response time detected"
+          description: "P99 response time is {{ $value | humanizeDuration }} (threshold: 100ms)"
+
+      - alert: LowThroughput
+        expr: rate(fraud_transactions_total[5m]) < 3000
+        for: 5m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "Transaction throughput below target"
+          description: "Current throughput: {{ $value | humanize }} TPS (target: 5000 TPS)"
+
+      # Fraud Detection
+      - alert: HighFraudRate
+        expr: rate(fraud_detected_total[1h]) / rate(fraud_transactions_total[1h]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: ml
+        annotations:
+          summary: "Abnormally high fraud rate detected"
+          description: "Fraud rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+
+      - alert: FraudDetectionFailure
+        expr: rate(fraud_errors_total[5m]) > 0.01
+        for: 2m
+        labels:
+          severity: critical
+          component: ml
+        annotations:
+          summary: "Fraud detection errors increasing"
+          description: "Error rate: {{ $value | humanize }} errors/sec"
+
+      # Cache Performance
+      - alert: LowCacheHitRate
+        expr: fraud_cache_hit_rate < 0.7
+        for: 5m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: "Cache hit rate below threshold"
+          description: "Cache hit rate: {{ $value | humanizePercentage }} (threshold: 70%)"
+
+      - alert: RedisConnectionFailure
+        expr: up{service="redis"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: cache
+        annotations:
+          summary: "Redis connection lost"
+          description: "Redis cache is unavailable"
+
+      # Kafka Streaming
+      - alert: KafkaConsumerLag
+        expr: kafka_consumer_lag > 10000
+        for: 5m
+        labels:
+          severity: warning
+          component: streaming
+        annotations:
+          summary: "Kafka consumer lag increasing"
+          description: "Consumer lag: {{ $value | humanize }} messages"
+
+      - alert: KafkaProducerErrors
+        expr: rate(kafka_producer_errors_total[5m]) > 0.01
+        for: 2m
+        labels:
+          severity: critical
+          component: streaming
+        annotations:
+          summary: "Kafka producer errors detected"
+          description: "Error rate: {{ $value | humanize }} errors/sec"
+
+      # Database
+      - alert: DatabaseConnectionPoolExhaustion
+        expr: pg_stat_database_numbackends / pg_settings_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Database connection pool nearly exhausted"
+          description: "Connection usage: {{ $value | humanizePercentage }}"
+
+      - alert: DatabaseSlowQueries
+        expr: rate(pg_stat_statements_mean_time_seconds[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Database queries are slow"
+          description: "Average query time: {{ $value | humanizeDuration }}"
+
+      # System Resources
+      - alert: HighCPUUsage
+        expr: rate(process_cpu_seconds_total[5m]) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "High CPU usage detected"
+          description: "CPU usage: {{ $value | humanize }}%"
+
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes / node_memory_MemTotal_bytes * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "High memory usage detected"
+          description: "Memory usage: {{ $value | humanize }}%"
+
+      - alert: DiskSpaceLow
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} < 0.1
+        for: 5m
+        labels:
+          severity: critical
+          component: infrastructure
+        annotations:
+          summary: "Low disk space"
+          description: "Available disk space: {{ $value | humanizePercentage }}"
+
+      # Business Metrics
+      - alert: HighFalsePositiveRate
+        expr: fraud_false_positives_total / fraud_transactions_total > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          component: business
+        annotations:
+          summary: "High false positive rate"
+          description: "False positive rate: {{ $value | humanizePercentage }} (threshold: 5%)"
+
+      - alert: LowModelAccuracy
+        expr: fraud_model_accuracy < 0.90
+        for: 10m
+        labels:
+          severity: critical
+          component: ml
+        annotations:
+          summary: "Model accuracy below threshold"
+          description: "Model accuracy: {{ $value | humanizePercentage }} (threshold: 90%)"
+
+      - alert: HighReviewQueueSize
+        expr: fraud_review_queue_size > 1000
+        for: 10m
+        labels:
+          severity: warning
+          component: business
+        annotations:
+          summary: "Manual review queue is growing"
+          description: "Review queue size: {{ $value | humanize }} transactions"
+
+  - name: service_health
+    interval: 30s
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.service }} is down"
+          description: "{{ $labels.service }} has been down for more than 1 minute"
+
+      - alert: MultipleServicesDown
+        expr: count(up == 0) > 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Multiple services are down"
+          description: "{{ $value }} services are currently down"
